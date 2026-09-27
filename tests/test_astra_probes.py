@@ -530,6 +530,122 @@ def test_archive_failure_retry_completes_archive_without_duplicate(tmp_path, mon
     assert report_rows == []
 
 
+# ----------------------------------------------------------------------
+# Astra's re-review (2026-09-27), same frozen item, held on a further gap:
+# sync.py:387-407 used to delete the CSV commit's pre-batch backups
+# *before* writing the batch-completion markers. An ordinary OSError from
+# a marker write then left the CSVs (and exceptions report) committed with
+# no marker for that workbook, so a retry re-validated it and rejected its
+# own already-applied row as a spurious `duplicate_key`. The fix keeps the
+# backups until every marker write in the batch has also succeeded, and
+# rolls back both the CSVs and any markers already written this batch if
+# one fails.
+# Source: ~/vault/40-sessions/2026-09-27-astra-team-marker-recheck.md.
+# ----------------------------------------------------------------------
+
+
+def test_marker_write_failure_on_first_marker_rolls_back_csv_commit(tmp_path, monkeypatch):
+    """Inject an OSError into the very first (and only) marker write of a
+    one-workbook batch, right after its row swapped into `tasks.csv`. The
+    CSV commit must be rolled back to its pre-batch backup -- not left
+    committed with no marker -- so the retry redoes the batch cleanly
+    instead of reporting a false `duplicate_key`."""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    data = tmp_path / "data"
+    _init_empty_tables(data)
+
+    w = Workbook()
+    w.remove(w.active)
+    s = w.create_sheet(SHEET_TITLES["tasks"])
+    s.append(schema.TASKS.columns)
+    s.append([_task()[c] for c in schema.TASKS.columns])
+    w.save(inbox / "one.xlsx")
+
+    import team_dashboard.sync as sync_mod
+
+    def fail_marker(marker_path, payload):
+        raise OSError("injected first-marker failure")
+
+    monkeypatch.setattr(sync_mod, "_write_marker", fail_marker)
+    with pytest.raises(OSError):
+        sync(inbox, data, tmp_path / "exceptions.csv")
+    monkeypatch.undo()
+
+    # Rolled all the way back: no row committed, no marker, no leftover
+    # backup or staged residue, workbook still pending in the inbox, and
+    # the lock is released even though the call failed.
+    assert len(csv_io.read_rows(data / schema.TASKS.filename, schema.TASKS)) == 0
+    assert list((data / "committed_batches").glob("*.json")) == []
+    assert list(data.glob("*.backup-*")) == []
+    assert list(data.glob("*.stage-*")) == []
+    assert (inbox / "one.xlsx").exists()
+    assert not (data / ".sync.lock").exists()
+
+    retry = sync(inbox, data, tmp_path / "exceptions.csv")
+    assert retry["exceptions"] == 0  # no spurious duplicate_key
+    assert retry["accepted"]["tasks"] == 1  # redone cleanly, not a false duplicate
+    assert retry["already_committed"]["tasks"] == 0
+    assert len(csv_io.read_rows(data / schema.TASKS.filename, schema.TASKS)) == 1
+    assert list((data / "committed_batches").glob("*.json")) != []
+
+
+def test_marker_write_failure_on_later_marker_rolls_back_earlier_marker_too(tmp_path, monkeypatch):
+    """Two workbooks commit in the same batch. The first workbook's marker
+    write succeeds; the second's fails with an ordinary OSError. Both
+    workbooks' rows must be rolled back together (they committed together)
+    and the first marker -- already written -- must be removed too, not
+    left behind describing a row that no longer exists once the CSVs are
+    rolled back."""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    data = tmp_path / "data"
+    _init_empty_tables(data)
+
+    for name, task_id in (("one.xlsx", "T1"), ("two.xlsx", "T2")):
+        w = Workbook()
+        w.remove(w.active)
+        s = w.create_sheet(SHEET_TITLES["tasks"])
+        s.append(schema.TASKS.columns)
+        s.append([_task(task_id=task_id)[c] for c in schema.TASKS.columns])
+        w.save(inbox / name)
+
+    import team_dashboard.sync as sync_mod
+    real_write_marker = sync_mod._write_marker
+    seen_sources: list[str] = []
+
+    def fail_second_marker(marker_path, payload):
+        seen_sources.append(payload["source"])
+        if payload["source"] == "two.xlsx":
+            raise OSError("injected later-marker failure")
+        return real_write_marker(marker_path, payload)
+
+    monkeypatch.setattr(sync_mod, "_write_marker", fail_second_marker)
+    with pytest.raises(OSError):
+        sync(inbox, data, tmp_path / "exceptions.csv")
+    monkeypatch.undo()
+
+    assert seen_sources == ["one.xlsx", "two.xlsx"]  # first succeeded before the second failed
+    # Full rollback: neither row committed, no marker survives for either
+    # workbook -- including the first one, whose marker had already been
+    # written -- no leftover backup or staged residue, both workbooks
+    # still pending.
+    assert len(csv_io.read_rows(data / schema.TASKS.filename, schema.TASKS)) == 0
+    assert list((data / "committed_batches").glob("*.json")) == []
+    assert list(data.glob("*.backup-*")) == []
+    assert list(data.glob("*.stage-*")) == []
+    assert (inbox / "one.xlsx").exists()
+    assert (inbox / "two.xlsx").exists()
+    assert not (data / ".sync.lock").exists()
+
+    retry = sync(inbox, data, tmp_path / "exceptions.csv")
+    assert retry["exceptions"] == 0
+    assert retry["accepted"]["tasks"] == 2  # both redone cleanly, neither a false duplicate
+    assert retry["already_committed"]["tasks"] == 0
+    assert len(csv_io.read_rows(data / schema.TASKS.filename, schema.TASKS)) == 2
+    assert len(list((data / "committed_batches").glob("*.json"))) == 2
+
+
 def test_readers_do_not_see_a_sync_batch_half_committed(tmp_path):
     """`compute_kpis` (and therefore `refresh`) must never observe
     `data_dir` partway through a `sync()` batch commit. It now takes the

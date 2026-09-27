@@ -26,30 +26,43 @@ Two properties this module is written to hold, beyond per-row validation:
   batch changes is first moved aside with its own atomic rename, then
   the staged replacement is swapped into its place; if any step raises,
   every already-swapped file in this batch is put back from its backup
-  before the error propagates. A fault anywhere during commit, not only
-  during staging, therefore still leaves every canonical CSV, the
-  exceptions report, and the inbox exactly as they were before this
-  call, and a retry starts clean rather than replaying a partially
-  committed batch as a false duplicate.
-- **Durable batch-completion marker, written before archiving.** Once a
-  batch's canonical CSVs have committed, this module writes one durable
+  before the error propagates. The pre-batch backups are *not* cleaned
+  up as soon as the swap succeeds, though -- see the next point, which
+  folds them into the same rollback boundary as the batch-completion
+  markers. A fault anywhere during commit, not only during staging,
+  therefore still leaves every canonical CSV, the exceptions report,
+  and the inbox exactly as they were before this call, and a retry
+  starts clean rather than replaying a partially committed batch as a
+  false duplicate.
+- **Durable batch-completion marker, written before archiving -- and
+  still inside the commit's rollback boundary.** Once a batch's
+  canonical CSVs have swapped into place, this module writes one durable
   marker per input workbook -- keyed by the sha256 of that workbook's own
   bytes, under `data_dir/committed_batches/` -- *before* attempting to
-  archive it. If archiving then fails (an injected fault, a permissions
-  error, a full disk), the workbook stays in the inbox, but its marker
-  already exists: a retry recognises it by content hash, does not
-  re-parse or re-validate it (so its rows can never come back as a
-  spurious `duplicate_key`), reports its rows as already committed, and
-  simply finishes the archive step. The one case this doesn't cover is a
-  hard-killed process (not an ordinary exception) landing in the narrow
-  window between the commit finishing and the marker being written, or
-  between the marker being written and the rename into `processed/` --
-  see the README's "Limits" section for that residual, by-hand-
-  recoverable window, the same class of caveat as the stale `.sync.lock`
-  file below. A `.sync.lock` file in `data_dir` enforces the local
-  single-writer-or-reader restriction this implies (see the README) --
-  `kpis.compute_kpis` takes the same lock around its reads, so a refresh
-  never observes this batch commit half-applied across the five tables.
+  archive it. The CSV swap's pre-batch backups are kept around, unswept,
+  until this marker-writing loop has also finished: an ordinary write
+  failure on any marker (an injected fault, a permissions error, a full
+  disk) rolls the CSVs and exceptions report back to those backups and
+  removes any markers this batch already wrote, exactly as if the commit
+  itself had failed, so a retry sees a clean pre-batch state and redoes
+  the whole batch rather than reporting it as a false duplicate. Only
+  once every marker has been written do the backups actually get
+  deleted. From then on, if archiving a workbook fails (an injected
+  fault, a permissions error, a full disk), the workbook stays in the
+  inbox, but its marker already exists: a retry recognises it by content
+  hash, does not re-parse or re-validate it (so its rows can never come
+  back as a spurious `duplicate_key`), reports its rows as already
+  committed, and simply finishes the archive step. The one case this
+  doesn't cover is a hard-killed process (not an ordinary exception)
+  landing in the narrow window between a marker being written and the
+  backups being swept, or between the sweep and the rename into
+  `processed/` -- see the README's "Limits" section for that residual,
+  by-hand-recoverable window, the same class of caveat as the stale
+  `.sync.lock` file below. A `.sync.lock` file in `data_dir` enforces the
+  local single-writer-or-reader restriction this implies (see the
+  README) -- `kpis.compute_kpis` takes the same lock around its reads,
+  so a refresh never observes this batch commit half-applied across the
+  five tables.
 """
 
 from __future__ import annotations
@@ -384,27 +397,59 @@ def sync(inbox_dir: Path, data_dir: Path, exceptions_path: Path) -> dict:
             for tmp_path in staged.values():
                 tmp_path.unlink(missing_ok=True)
             raise
+        # Note: the pre-batch backups in `renamed_away` are deliberately
+        # *not* cleaned up here. The CSV swap above is not final until
+        # every batch-completion marker below has also been written --
+        # see that section for why -- so the backups stay in place until
+        # then, whatever happens next.
+
+        # --- batch-completion markers ------------------------------------
+        # The canonical CSVs and the exceptions report have now been
+        # swapped into place, but this batch is not yet durable: its
+        # pre-batch backups are kept until every marker below has also
+        # succeeded. Once a batch's canonical CSVs have committed, this
+        # module writes one durable marker per input workbook -- keyed by
+        # the sha256 of that workbook's own bytes, under
+        # `data_dir/committed_batches/` -- before attempting to archive it,
+        # so that if the archive step further below fails (an injected
+        # fault, a full disk, a permissions error) a retry recognises this
+        # exact input as already committed instead of re-validating it and
+        # rejecting its own already-applied rows as `duplicate_key`.
+        #
+        # But an ordinary OSError writing one of *these* markers (a full
+        # disk, a permissions error) must not leave the CSVs committed
+        # with no marker -- a retry would then see committed rows and no
+        # marker, and reject its own already-applied rows as a false
+        # `duplicate_key`. So this loop is its own rollback boundary: if
+        # any marker write fails, every marker this batch already wrote is
+        # removed and the CSVs (and exceptions report) are restored from
+        # the still-held backups, before the error propagates. A retry
+        # then sees the clean pre-batch state and redoes the whole batch.
+        markers_written: list[Path] = []
+        try:
+            for wb_path in processed_workbook_paths:
+                marker_path = _marker_path(data_dir, content_hash_by_path[wb_path])
+                _write_marker(
+                    marker_path,
+                    {
+                        "source": wb_path.name,
+                        "committed_at": dt.datetime.now().isoformat(timespec="seconds"),
+                        "accepted": accepted_counts_by_workbook[wb_path],
+                    },
+                )
+                markers_written.append(marker_path)
+        except Exception:
+            for marker_path in markers_written:
+                marker_path.unlink(missing_ok=True)
+            for real_path in reversed(list(staged.keys())):
+                if real_path in renamed_away:
+                    os.replace(renamed_away[real_path], real_path)
+                else:
+                    real_path.unlink(missing_ok=True)
+            raise
         finally:
             for backup_path in renamed_away.values():
                 backup_path.unlink(missing_ok=True)
-
-        # --- batch-completion markers ------------------------------------
-        # The canonical CSVs and the exceptions report have now committed.
-        # Before touching the inbox at all, record one durable marker per
-        # newly-processed workbook, keyed by its own content hash, so that
-        # if the archive step below fails (an injected fault, a full disk,
-        # a permissions error) a retry recognises this exact input as
-        # already committed instead of re-validating it and rejecting its
-        # own already-applied rows as `duplicate_key`.
-        for wb_path in processed_workbook_paths:
-            _write_marker(
-                _marker_path(data_dir, content_hash_by_path[wb_path]),
-                {
-                    "source": wb_path.name,
-                    "committed_at": dt.datetime.now().isoformat(timespec="seconds"),
-                    "accepted": accepted_counts_by_workbook[wb_path],
-                },
-            )
 
         # A workbook recognised by its marker as already committed still
         # needs its rows counted for this run's report -- as already

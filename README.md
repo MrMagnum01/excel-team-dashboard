@@ -49,11 +49,17 @@ employer project.
    double-counting or wrongly rejecting a duplicate. Once the CSVs commit,
    a durable marker is written per input workbook — keyed by the sha256 of
    its own bytes, under `library/data/committed_batches/` — *before* that
-   workbook is archived; if the archive step itself then fails (see
-   "Limits" for the one residual case this doesn't cover), a retry
-   recognises the input by content hash, does not re-validate it, reports
-   its rows as already committed rather than a spurious duplicate, and
-   simply finishes archiving it. A `.sync.lock` file in `library/data/`
+   workbook is archived; the CSV commit's own pre-batch backups are kept
+   until every marker has been written, so an ordinary failure writing a
+   marker rolls the CSVs (and any markers already written this batch)
+   back too, and a retry redoes the whole batch cleanly instead of
+   falsely rejecting it as a duplicate. Only once every marker is written
+   are those backups actually removed; if the archive step itself then
+   fails (see "Limits" for the one residual case this doesn't cover), a
+   retry recognises the input by content hash, does not re-validate it,
+   reports its rows as already committed rather than a spurious
+   duplicate, and simply finishes archiving it. A `.sync.lock` file in
+   `library/data/`
    enforces a local single-writer-or-reader restriction: `sync` holds it
    for the duration of one call, and `refresh` takes the same lock around
    its reads, so a refresh can never observe the five CSVs mid-commit —
@@ -310,8 +316,10 @@ LICENSES.md             every open-source library used and its licence
   reading a partial batch; it isn't a reader/writer lock that lets
   multiple refreshes overlap a sync's wait, just mutual exclusion.
 - `sync`'s batch commit makes each `sync()` call all-or-nothing for any
-  ordinary exception during staging or commit (backup-then-swap-then-
-  cleanup rolls back every already-applied rename in the batch — see
+  ordinary exception during staging, commit, or the batch-completion
+  marker writes that follow it (backup-then-swap-then-cleanup rolls back
+  every already-applied rename in the batch, and the pre-batch backups
+  are kept, unswept, until every marker has also been written — see
   `sync.py`'s module docstring), but it is not a durable transaction log
   across a hard-killed process (not an ordinary exception) between two of
   those renames: that can leave a stray `*.backup-<batch-id>` file next to
@@ -328,10 +336,11 @@ LICENSES.md             every open-source library used and its licence
   attempted, so a retry recognises the input and finishes archiving it
   without re-validating or double-counting its rows. What this still
   doesn't cover is a hard-killed process (not an ordinary exception)
-  landing in the narrow window between the CSV commit and the marker
-  write, or between the marker write and the archive rename — the same
-  by-hand-recoverable class of caveat as the two above, not a claim of a
-  fully durable transaction log. `library/data/committed_batches/` is
+  landing in the narrow window between the last marker of a batch being
+  written and that batch's pre-commit backups being swept, or between
+  that sweep and the archive rename — the same by-hand-recoverable class
+  of caveat as the two above, not a claim of a fully durable transaction
+  log. `library/data/committed_batches/` is
   never pruned by this demo; markers accumulate for as long as `library/`
   exists.
 
