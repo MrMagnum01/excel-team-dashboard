@@ -20,6 +20,7 @@ and `-rereview.md`/`-rereview-probes.json`.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -459,3 +460,89 @@ def test_future_resolved_date_blocker_still_counts_as_open(tmp_path):
     csv_io.write_rows(data / "blockers.csv", schema.BLOCKERS, [blocker])
     k = compute_kpis(data, AS_OF)
     assert k["overall"].open_blockers_total == 1
+
+
+# ============================================================================
+# Frozen item 1 (2026-09-27, MUST-FIX) -- coherent sync commit and retry.
+# Source: ~/vault/40-sessions/2026-09-27-astra-excel-team-dashboard-frozen-
+# check.md and its -frozen-probes.py/-frozen-results.json. Before this fix:
+# injecting an OSError into the archive-phase rename (after the CSV commit
+# had already succeeded) left the task committed and the workbook pending;
+# a retry archived it but reported its own already-committed row as a
+# spurious `duplicate_key`, and no durable batch/source marker existed.
+# Readers (`compute_kpis`/`refresh`) also read `data_dir` without
+# participating in `sync`'s lock at all, so a batch commit in progress
+# could be observed as a mix of pre- and post-batch tables.
+# ============================================================================
+
+
+def test_archive_failure_retry_completes_archive_without_duplicate(tmp_path, monkeypatch):
+    """Reproduces the frozen probe exactly: inject an OSError into the
+    archive-phase `Path.rename` for one workbook, after its row has
+    already committed to `tasks.csv`. The retry must not re-report that
+    row as `duplicate_key` -- it must recognise the input by content hash,
+    count its row as already committed (not freshly accepted, not
+    rejected), and finish archiving it."""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    data = tmp_path / "data"
+    _init_empty_tables(data)
+
+    w = Workbook()
+    w.remove(w.active)
+    s = w.create_sheet(SHEET_TITLES["tasks"])
+    s.append(schema.TASKS.columns)
+    s.append([_task()[c] for c in schema.TASKS.columns])
+    w.save(inbox / "one.xlsx")
+
+    real_rename = Path.rename
+
+    def fail_archive(self, target):
+        if self.name == "one.xlsx":
+            raise OSError("injected archive failure")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_archive)
+    with pytest.raises(OSError):
+        sync(inbox, data, tmp_path / "exceptions.csv")
+    monkeypatch.undo()
+
+    # The row committed even though the archive step that followed failed.
+    assert len(csv_io.read_rows(data / schema.TASKS.filename, schema.TASKS)) == 1
+    assert (inbox / "one.xlsx").exists()  # archive never completed
+    assert not (data / ".sync.lock").exists()  # lock released even on failure
+    assert len(list((data / "committed_batches").glob("*.json"))) == 1  # durable marker survives the failed archive
+
+    retry = sync(inbox, data, tmp_path / "exceptions.csv")
+    assert retry["exceptions"] == 0  # no spurious duplicate_key
+    assert retry["accepted"]["tasks"] == 0  # nothing newly appended this run
+    assert retry["already_committed"]["tasks"] == 1  # counted as already committed, not as a duplicate
+    assert retry["workbooks_processed"] == 1
+    assert not (inbox / "one.xlsx").exists()  # archive now completed
+    assert list((inbox / "processed").glob("*one.xlsx"))
+
+    report_rows = csv_io.read_rows(
+        tmp_path / "exceptions.csv",
+        schema.TableSchema(name="exceptions", filename="x", columns=[
+            "table", "source", "row_number", "category", "detail", "raw_row"
+        ], required=[]),
+    )
+    assert report_rows == []
+
+
+def test_readers_do_not_see_a_sync_batch_half_committed(tmp_path):
+    """`compute_kpis` (and therefore `refresh`) must never observe
+    `data_dir` partway through a `sync()` batch commit. It now takes the
+    same lock `sync()` holds for its entire commit (staging, commit, and
+    archive) -- simulated here by the same `.sync.lock` file `sync()`
+    itself creates -- so a batch in progress makes a concurrent read
+    refuse cleanly instead of reading a mix of pre- and post-batch tables
+    across the five CSVs."""
+    from team_dashboard.sync import SyncInProgressError
+
+    data = tmp_path / "data"
+    _init_empty_tables(data)
+    (data / ".sync.lock").write_text("12345")
+    with pytest.raises(SyncInProgressError):
+        compute_kpis(data, AS_OF)
+    assert (data / ".sync.lock").exists()  # a refused read must not remove a lock it didn't create

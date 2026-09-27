@@ -30,19 +30,36 @@ Two properties this module is written to hold, beyond per-row validation:
   during staging, therefore still leaves every canonical CSV, the
   exceptions report, and the inbox exactly as they were before this
   call, and a retry starts clean rather than replaying a partially
-  committed batch as a false duplicate. The one case this doesn't cover
-  is a hard-killed process (not an ordinary exception) between two of
-  those renames -- see the README's "Limits" section for that residual,
-  by-hand-recoverable window, the same class of caveat as the stale
-  `.sync.lock` file below. A `.sync.lock` file in `data_dir` enforces the
-  local single-writer restriction this implies (see the README).
+  committed batch as a false duplicate.
+- **Durable batch-completion marker, written before archiving.** Once a
+  batch's canonical CSVs have committed, this module writes one durable
+  marker per input workbook -- keyed by the sha256 of that workbook's own
+  bytes, under `data_dir/committed_batches/` -- *before* attempting to
+  archive it. If archiving then fails (an injected fault, a permissions
+  error, a full disk), the workbook stays in the inbox, but its marker
+  already exists: a retry recognises it by content hash, does not
+  re-parse or re-validate it (so its rows can never come back as a
+  spurious `duplicate_key`), reports its rows as already committed, and
+  simply finishes the archive step. The one case this doesn't cover is a
+  hard-killed process (not an ordinary exception) landing in the narrow
+  window between the commit finishing and the marker being written, or
+  between the marker being written and the rename into `processed/` --
+  see the README's "Limits" section for that residual, by-hand-
+  recoverable window, the same class of caveat as the stale `.sync.lock`
+  file below. A `.sync.lock` file in `data_dir` enforces the local
+  single-writer-or-reader restriction this implies (see the README) --
+  `kpis.compute_kpis` takes the same lock around its reads, so a refresh
+  never observes this batch commit half-applied across the five tables.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import os
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -57,17 +74,74 @@ PROCESS_ORDER = [schema.TASKS, schema.BLOCKERS, schema.WEEKLY_UPDATES, schema.AC
 
 LOCK_NAME = ".sync.lock"
 
+# Durable per-input-file "this batch already committed" markers. Keyed by
+# the sha256 of the workbook's own bytes, written *after* the canonical
+# CSVs (and the exceptions report) have committed but *before* that
+# workbook is archived -- see `sync()`'s "batch-completion marker" phase
+# below and the README's "Limits" section.
+COMMITTED_BATCHES_DIR = "committed_batches"
+
 
 class SyncInProgressError(RuntimeError):
-    """Another `sync()` already holds the lock on this `data_dir`.
+    """Another `sync()` -- or a reader taking the same lock -- already
+    holds the lock on this `data_dir`.
 
-    This demo enforces a local single-writer restriction instead of real
-    concurrency control -- there is no SharePoint tenant here to provide
-    that (see the README's "library/ stands in for..." section). If a
-    prior run crashed hard enough to skip its cleanup (killed, not an
-    ordinary exception), the stale `.sync.lock` file must be removed by
-    hand before the next run.
+    This demo enforces a local single-writer-or-reader restriction instead
+    of real concurrency control -- there is no SharePoint tenant here to
+    provide that (see the README's "library/ stands in for..." section).
+    `kpis.compute_kpis` takes this same lock around its reads (see
+    `sync_lock` below) so a refresh can never observe a data directory
+    mid-commit; it simply refuses, the same way a second concurrent
+    `sync()` already did, rather than blocking or reading a partial
+    snapshot. If a prior run crashed hard enough to skip its cleanup
+    (killed, not an ordinary exception), the stale `.sync.lock` file must
+    be removed by hand before the next run.
     """
+
+
+@contextmanager
+def sync_lock(data_dir: Path):
+    """Acquire the local single-writer-or-reader lock on `data_dir`.
+
+    Used by `sync()` itself and by `kpis.compute_kpis` (a reader): both
+    hold the *same* lock, so a reader can never see `data_dir` partway
+    through a `sync()` batch commit -- it either reads before the batch
+    starts or after it (and its archive step) has fully finished, never a
+    mix of old and new files across the five tables.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir / LOCK_NAME
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise SyncInProgressError(
+            f"{lock_path} already exists -- another sync() (or a reader) is using {data_dir} right now "
+            "(local single-writer-or-reader restriction; see SyncInProgressError's docstring if this is stale)"
+        )
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    try:
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def _content_hash(path: Path) -> str:
+    """sha256 of the input workbook's own bytes -- the key a batch's
+    "already committed" marker is filed under, so a byte-identical retry
+    of the same input is recognised regardless of its filename."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _marker_path(data_dir: Path, content_hash: str) -> Path:
+    return data_dir / COMMITTED_BATCHES_DIR / f"{content_hash}.json"
+
+
+def _write_marker(marker_path: Path, payload: dict) -> None:
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = marker_path.with_name(marker_path.name + f".tmp-{uuid.uuid4().hex}")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp_path, marker_path)
 
 
 def _normalize(value):
@@ -150,21 +224,25 @@ def sync(inbox_dir: Path, data_dir: Path, exceptions_path: Path) -> dict:
     data_dir.mkdir(parents=True, exist_ok=True)
     processed_dir = inbox_dir / "processed"
 
-    lock_path = data_dir / LOCK_NAME
-    try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise SyncInProgressError(
-            f"{lock_path} already exists -- another sync() is writing to {data_dir} right now "
-            "(local single-writer restriction; see SyncInProgressError's docstring if this is stale)"
-        )
-    os.write(fd, str(os.getpid()).encode())
-    os.close(fd)
-
-    try:
+    with sync_lock(data_dir):
         workbook_paths = sorted(
             p for p in inbox_dir.glob("*.xlsx") if p.is_file() and not p.name.startswith("~$")
         )
+
+        # Split the inbox into workbooks this batch has never seen before
+        # and ones whose *exact* bytes a prior `sync()` call already
+        # committed but failed to archive (see the module docstring's
+        # "durable batch-completion marker" section). The latter are
+        # skipped from parsing/validation entirely -- their rows are
+        # already in the canonical CSVs -- and only need archiving, again.
+        content_hash_by_path = {p: _content_hash(p) for p in workbook_paths}
+        already_committed_paths: list[Path] = []
+        new_paths: list[Path] = []
+        for p in workbook_paths:
+            if _marker_path(data_dir, content_hash_by_path[p]).exists():
+                already_committed_paths.append(p)
+            else:
+                new_paths.append(p)
 
         existing_keys = {t.name: _existing_keys(data_dir, t) for t in PROCESS_ORDER}
         known_task_ids = {row["task_id"] for row in csv_io.read_rows(data_dir / schema.TASKS.filename, schema.TASKS)}
@@ -172,8 +250,9 @@ def sync(inbox_dir: Path, data_dir: Path, exceptions_path: Path) -> dict:
         accepted_by_table: dict[str, list[dict]] = {t.name: [] for t in PROCESS_ORDER}
         all_exceptions: list[Exception_] = []
         processed_workbook_paths: list[Path] = []
+        accepted_counts_by_workbook: dict[Path, dict[str, int]] = {}
 
-        for wb_path in workbook_paths:
+        for wb_path in new_paths:
             try:
                 wb = load_workbook(wb_path, data_only=True)
             except Exception as exc:  # noqa: BLE001 - any of openpyxl's several "not a valid workbook" errors
@@ -184,6 +263,7 @@ def sync(inbox_dir: Path, data_dir: Path, exceptions_path: Path) -> dict:
                 continue  # left in the inbox untouched -- nothing was read, so nothing to retry-corrupt
 
             consumed_sheets: set[str] = set()
+            this_wb_accepted = {t.name: 0 for t in PROCESS_ORDER}
             for table in PROCESS_ORDER:
                 sheet_title = SHEET_TITLES[table.name]
                 if sheet_title not in wb.sheetnames:
@@ -209,6 +289,7 @@ def sync(inbox_dir: Path, data_dir: Path, exceptions_path: Path) -> dict:
                     known_task_ids=known_task_ids if table.name == "blockers" else None,
                 )
                 accepted_by_table[table.name].extend(accepted)
+                this_wb_accepted[table.name] += len(accepted)
                 all_exceptions.extend(exceptions)
                 if table.name == "tasks":
                     known_task_ids.update(r["task_id"] for r in accepted)
@@ -229,6 +310,7 @@ def sync(inbox_dir: Path, data_dir: Path, exceptions_path: Path) -> dict:
                                    f"{sorted(SHEET_TITLES.values())} and was not processed", {})
                     )
 
+            accepted_counts_by_workbook[wb_path] = this_wb_accepted
             processed_workbook_paths.append(wb_path)
 
         # --- staging phase -----------------------------------------------
@@ -306,20 +388,51 @@ def sync(inbox_dir: Path, data_dir: Path, exceptions_path: Path) -> dict:
             for backup_path in renamed_away.values():
                 backup_path.unlink(missing_ok=True)
 
+        # --- batch-completion markers ------------------------------------
+        # The canonical CSVs and the exceptions report have now committed.
+        # Before touching the inbox at all, record one durable marker per
+        # newly-processed workbook, keyed by its own content hash, so that
+        # if the archive step below fails (an injected fault, a full disk,
+        # a permissions error) a retry recognises this exact input as
+        # already committed instead of re-validating it and rejecting its
+        # own already-applied rows as `duplicate_key`.
+        for wb_path in processed_workbook_paths:
+            _write_marker(
+                _marker_path(data_dir, content_hash_by_path[wb_path]),
+                {
+                    "source": wb_path.name,
+                    "committed_at": dt.datetime.now().isoformat(timespec="seconds"),
+                    "accepted": accepted_counts_by_workbook[wb_path],
+                },
+            )
+
+        # A workbook recognised by its marker as already committed still
+        # needs its rows counted for this run's report -- as already
+        # committed, never as a fresh `accepted` count (nothing of theirs
+        # was touched this run) and never as a `duplicate_key` exception
+        # (they were never re-validated at all).
+        already_committed_by_table = {t.name: 0 for t in PROCESS_ORDER}
+        for wb_path in already_committed_paths:
+            marker = json.loads(_marker_path(data_dir, content_hash_by_path[wb_path]).read_text(encoding="utf-8"))
+            for name, count in marker.get("accepted", {}).items():
+                if name in already_committed_by_table:
+                    already_committed_by_table[name] += count
+
         # --- archive phase ---------------------------------------------
-        # Only workbooks that were actually read (not ones that failed to
-        # even open) get moved out of the inbox, and only after the batch
-        # they contributed to has committed.
-        if processed_workbook_paths:
+        # Every workbook that contributed to this batch's commit -- freshly
+        # processed just now, or already committed by an earlier run and
+        # only now catching up on a previously failed archive step -- is
+        # moved out of the inbox.
+        to_archive = processed_workbook_paths + already_committed_paths
+        if to_archive:
             processed_dir.mkdir(parents=True, exist_ok=True)
             stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
-            for wb_path in processed_workbook_paths:
+            for wb_path in to_archive:
                 wb_path.rename(processed_dir / f"{stamp}_{wb_path.name}")
 
         return {
             "accepted": {name: len(rows) for name, rows in accepted_by_table.items()},
+            "already_committed": already_committed_by_table,
             "exceptions": len(all_exceptions),
-            "workbooks_processed": len(processed_workbook_paths),
+            "workbooks_processed": len(to_archive),
         }
-    finally:
-        lock_path.unlink(missing_ok=True)

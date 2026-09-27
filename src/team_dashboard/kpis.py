@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import csv_io, schema
 from .csv_io import SourceDataError
+from .sync import sync_lock
 from .teams import TEAMS
 from .validation import validate_rows
 
@@ -72,10 +73,18 @@ def compute_kpis(data_dir: Path, as_of: date, num_weeks: int = 8, teams: list[st
     """Return {"teams": {name: TeamKPIs}, "overall": TeamKPIs, "week_endings": [...]}."""
     team_names = teams if teams is not None else list(TEAMS.keys())
 
-    tasks = _load_required(data_dir, schema.TASKS)
-    known_task_ids = {row["task_id"] for row in tasks}
-    blockers = _load_required(data_dir, schema.BLOCKERS, known_task_ids=known_task_ids)
-    achievements = _load_required(data_dir, schema.ACHIEVEMENTS)
+    # Read all three tables under the same lock `sync()` holds for its
+    # entire batch commit (staging, commit, and archive) -- see
+    # `sync.sync_lock`'s docstring. Without this, a refresh running
+    # concurrently with a sync's multi-file commit could read some tables
+    # from before the batch and others from after it: a snapshot that
+    # never actually existed. With it, a refresh either sees the complete
+    # state before this batch or the complete state after it, never a mix.
+    with sync_lock(data_dir):
+        tasks = _load_required(data_dir, schema.TASKS)
+        known_task_ids = {row["task_id"] for row in tasks}
+        blockers = _load_required(data_dir, schema.BLOCKERS, known_task_ids=known_task_ids)
+        achievements = _load_required(data_dir, schema.ACHIEVEMENTS)
 
     windows = week_windows(as_of, num_weeks)
     week_endings = [w[1] for w in windows]

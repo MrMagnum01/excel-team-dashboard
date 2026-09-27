@@ -46,17 +46,28 @@ employer project.
    backup before the error is raised — a failure partway through, staging
    or commit, leaves every CSV, the exceptions report, and the inbox
    exactly as they were, so a retry starts clean instead of
-   double-counting or wrongly rejecting a duplicate (see "Limits" for the
-   one residual case this doesn't cover). A `.sync.lock` file in
-   `library/data/` enforces a local single-writer restriction for the
-   duration of one `sync` call. Processed workbooks are moved to
+   double-counting or wrongly rejecting a duplicate. Once the CSVs commit,
+   a durable marker is written per input workbook — keyed by the sha256 of
+   its own bytes, under `library/data/committed_batches/` — *before* that
+   workbook is archived; if the archive step itself then fails (see
+   "Limits" for the one residual case this doesn't cover), a retry
+   recognises the input by content hash, does not re-validate it, reports
+   its rows as already committed rather than a spurious duplicate, and
+   simply finishes archiving it. A `.sync.lock` file in `library/data/`
+   enforces a local single-writer-or-reader restriction: `sync` holds it
+   for the duration of one call, and `refresh` takes the same lock around
+   its reads, so a refresh can never observe the five CSVs mid-commit —
+   see "KPI definitions" below. Processed workbooks are moved to
    `library/inbox/processed/` so a re-run can't double-apply them.
 5. `refresh` — builds `library/dashboards/master-dashboard.xlsx` (all
    3 teams) and one distributed copy per team
    (`team-aurora-dashboard.xlsx`, etc.), all computed from the same five
-   CSVs. It refuses to run — rather than silently producing a
-   zero-activity dashboard — if a required CSV is missing or fails the
-   same schema validation `sync` uses (see "KPI definitions" below). Each
+   CSVs, read under the same lock `sync` holds for its own batch commit
+   so a refresh can never observe some tables from before a commit and
+   others from after it. It refuses to run — rather than silently
+   producing a zero-activity dashboard — if a required CSV is missing or
+   fails the same schema validation `sync` uses (see "KPI definitions"
+   below). Each
    dashboard has: a KPI table (done vs planned, done %, overdue,
    open blockers, achievements this week), an Overdue Tasks sheet, an
    Open Blockers sheet (sorted by age), an Achievements This Week sheet,
@@ -287,12 +298,17 @@ LICENSES.md             every open-source library used and its licence
   ever made.
 - 3 fictional teams / 4 members each / 8 weeks of history is the demo
   scale; nothing in the code hardcodes those numbers except the generator.
-- `sync`'s single-writer lock (`library/data/.sync.lock`) is a local file
-  that a hard-killed process (not an ordinary exception) can leave behind;
-  a stale lock has to be removed by hand before the next run. This is
-  the "local single-writer restriction" this demo relies on instead of
-  real concurrent-write handling — there is no SharePoint tenant here to
-  need that against.
+- `sync`'s single-writer-or-reader lock (`library/data/.sync.lock`) is a
+  local file that a hard-killed process (not an ordinary exception) can
+  leave behind; a stale lock has to be removed by hand before the next
+  run. `sync` holds it for its whole call, and `refresh` (via
+  `compute_kpis`) takes the *same* lock around its reads, so this is the
+  "local single-writer-or-reader restriction" this demo relies on instead
+  of real concurrent-access handling — there is no SharePoint tenant here
+  to need that against. A refresh that starts while a sync holds the lock
+  refuses immediately (`SyncInProgressError`) rather than blocking or
+  reading a partial batch; it isn't a reader/writer lock that lets
+  multiple refreshes overlap a sync's wait, just mutual exclusion.
 - `sync`'s batch commit makes each `sync()` call all-or-nothing for any
   ordinary exception during staging or commit (backup-then-swap-then-
   cleanup rolls back every already-applied rename in the batch — see
@@ -303,6 +319,21 @@ LICENSES.md             every open-source library used and its licence
   `sync` run — the same class of by-hand-recoverable caveat as the stale
   `.sync.lock` file above, and an equally narrow window (a handful of fast
   local renames), not a claim that no window exists at all.
+- The archive step (moving a processed workbook into
+  `library/inbox/processed/`) is now separately recoverable for any
+  *ordinary* exception there (a full disk, a permissions error): the
+  canonical CSVs already committed by that point, and a durable marker —
+  keyed by the workbook's own content hash, under
+  `library/data/committed_batches/` — is written before the archive is
+  attempted, so a retry recognises the input and finishes archiving it
+  without re-validating or double-counting its rows. What this still
+  doesn't cover is a hard-killed process (not an ordinary exception)
+  landing in the narrow window between the CSV commit and the marker
+  write, or between the marker write and the archive rename — the same
+  by-hand-recoverable class of caveat as the two above, not a claim of a
+  fully durable transaction log. `library/data/committed_batches/` is
+  never pruned by this demo; markers accumulate for as long as `library/`
+  exists.
 
 ## Target Upwork job types
 
