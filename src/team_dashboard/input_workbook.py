@@ -29,6 +29,10 @@ SHEET_TITLES = {
     "kpi_targets": "New KPI Targets",
 }
 
+# Sheets the input workbook ships that are not a data table -- `sync.py`
+# must not treat these (or their absence) as an unrecognised submission.
+NON_DATA_SHEETS = {"Start Here", "Lists"}
+
 
 def _add_lists_sheet(wb: Workbook):
     ws = wb.create_sheet("Lists")

@@ -33,13 +33,33 @@ def _kpi_row(team: str, tk: TeamKPIs) -> list:
     return [team, tk.planned_total, tk.done_total, done_pct, tk.overdue_total, tk.open_blockers_total, tk.achievements_this_week]
 
 
+# Leading characters that would make Excel/openpyxl treat a plain-text
+# value as an executable formula (`=`, `+`, `-`, `@`) or that spreadsheet
+# software can otherwise misinterpret (tab, CR). Source text -- task
+# titles, descriptions, summaries -- is untrusted input that reached this
+# dashboard via `sync`'s CSVs, and must render as inert text, never as a
+# formula `sync` or a human never asked for.
+_FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _write_cell(ws, row: int, col: int, val):
+    cell = ws.cell(row=row, column=col, value=val)
+    if isinstance(val, str) and val.startswith(_FORMULA_TRIGGER_CHARS):
+        # openpyxl auto-detects a leading "=" as a formula and sets
+        # data_type "f" accordingly; forcing it back to "s" (string) here
+        # writes the exact same text back out as an inert value -- Excel
+        # never recalculates it, it just displays literally.
+        cell.data_type = "s"
+    return cell
+
+
 def _write_table(ws, start_row: int, headers: list[str], rows: list[list]) -> int:
     for c, h in enumerate(headers, start=1):
-        cell = ws.cell(row=start_row, column=c, value=h)
+        cell = _write_cell(ws, start_row, c, h)
         cell.font = Font(bold=True)
     for r, row in enumerate(rows, start=start_row + 1):
         for c, val in enumerate(row, start=1):
-            ws.cell(row=r, column=c, value=val)
+            _write_cell(ws, r, c, val)
     for c, h in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(c)].width = max(14, len(str(h)) + 2)
     return start_row + 1 + len(rows)  # next free row

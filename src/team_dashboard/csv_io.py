@@ -13,6 +13,15 @@ from pathlib import Path
 from .schema import TableSchema
 
 
+class SourceDataError(RuntimeError):
+    """A required canonical CSV is missing or fails schema validation.
+
+    Raised by callers (see `kpis.compute_kpis`) that must refuse to build a
+    dashboard from incomplete or corrupt source data rather than silently
+    treating an absent/invalid file as "zero activity".
+    """
+
+
 def write_rows(path: Path, schema: TableSchema, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:

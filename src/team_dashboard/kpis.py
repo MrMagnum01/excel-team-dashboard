@@ -15,11 +15,38 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from . import csv_io, schema
+from .csv_io import SourceDataError
 from .teams import TEAMS
+from .validation import validate_rows
 
 
 def _parse_date(s: str) -> date:
     return date.fromisoformat(s)
+
+
+def _load_required(data_dir: Path, table: schema.TableSchema, known_task_ids: set[str] | None = None) -> list[dict]:
+    """Read `table`'s canonical CSV, refusing to proceed on a missing or
+    invalid file rather than treating it as an empty/zero table.
+
+    `refresh` is documented as reading a completed, validated snapshot (see
+    README/docs/schema.md) -- these CSVs are meant to only ever contain
+    rows that already passed `validate_rows` in `sync`, so re-validating
+    them here is a corruption/tamper check, not routine work, and a clean
+    canonical CSV always passes with zero exceptions.
+    """
+    path = data_dir / table.filename
+    if not path.exists():
+        raise SourceDataError(
+            f"required source is missing: {path} -- refusing to build a dashboard against absent data "
+            "(a missing file is not the same as zero real activity)"
+        )
+    rows = csv_io.read_rows(path, table)
+    accepted, exceptions = validate_rows(table, rows, source=str(path), existing_keys=set(), known_task_ids=known_task_ids)
+    if exceptions:
+        detail = "; ".join(f"row {e.row_number} ({e.category}): {e.detail}" for e in exceptions[:5])
+        more = f" (+{len(exceptions) - 5} more)" if len(exceptions) > 5 else ""
+        raise SourceDataError(f"{path} failed schema validation on {len(exceptions)} row(s): {detail}{more}")
+    return accepted
 
 
 def week_windows(as_of: date, num_weeks: int) -> list[tuple[date, date]]:
@@ -44,9 +71,10 @@ def compute_kpis(data_dir: Path, as_of: date, num_weeks: int = 8, teams: list[st
     """Return {"teams": {name: TeamKPIs}, "overall": TeamKPIs, "week_endings": [...]}."""
     team_names = teams if teams is not None else list(TEAMS.keys())
 
-    tasks = csv_io.read_rows(data_dir / schema.TASKS.filename, schema.TASKS)
-    blockers = csv_io.read_rows(data_dir / schema.BLOCKERS.filename, schema.BLOCKERS)
-    achievements = csv_io.read_rows(data_dir / schema.ACHIEVEMENTS.filename, schema.ACHIEVEMENTS)
+    tasks = _load_required(data_dir, schema.TASKS)
+    known_task_ids = {row["task_id"] for row in tasks}
+    blockers = _load_required(data_dir, schema.BLOCKERS, known_task_ids=known_task_ids)
+    achievements = _load_required(data_dir, schema.ACHIEVEMENTS)
 
     windows = week_windows(as_of, num_weeks)
     week_endings = [w[1] for w in windows]
@@ -58,6 +86,13 @@ def compute_kpis(data_dir: Path, as_of: date, num_weeks: int = 8, teams: list[st
     for row in tasks:
         team = row["team"]
         if team not in result:
+            continue
+        # As-of snapshot policy: a row created after `as_of` did not exist
+        # yet as of this snapshot, so it is excluded entirely rather than
+        # counted into planned/done totals for a date it postdates -- see
+        # "KPI definitions" in the README for why this isn't arbitrary
+        # historical reconstruction from mutable current status.
+        if _parse_date(row["created_date"]) > as_of:
             continue
         tk = result[team]
         planned_date = _parse_date(row["planned_date"])
@@ -79,6 +114,8 @@ def compute_kpis(data_dir: Path, as_of: date, num_weeks: int = 8, teams: list[st
         team = row["team"]
         if team not in result or row["status"] != "Open":
             continue
+        if _parse_date(row["raised_date"]) > as_of:
+            continue  # not raised yet as of this snapshot -- see as-of policy above
         tk = result[team]
         tk.open_blockers_total += 1
         tk.open_blockers_by_owner[row["owner"]] = tk.open_blockers_by_owner.get(row["owner"], 0) + 1

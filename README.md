@@ -28,20 +28,36 @@ employer project.
 3. `sample-inbox` — builds one filled-in-looking input workbook for the
    demo: a mix of valid rows and one row from every bad-input class `sync`
    checks for, so the demo run actually shows rejections happening.
-4. `sync` — reads every `.xlsx` dropped into `library/inbox/`, validates
-   every row (required fields, dates, enums, team/member membership,
-   non-negative numbers, blocker-references-a-real-task, no duplicates),
-   appends the valid rows to the CSVs, and writes every rejected row to
-   `library/exceptions_report.csv` with a category and detail — nothing is
-   silently dropped. Processed workbooks are moved to
-   `library/inbox/processed/` so a re-run can't double-apply them.
+4. `sync` — reads every `.xlsx` dropped into `library/inbox/`, resolves
+   each sheet's columns by its header row (not by position — a
+   reordered, duplicated, missing, or extra header is rejected as an
+   exception rather than misread), validates every row (required fields,
+   dates, enums, team/member membership, finite non-negative numbers,
+   Done/Resolved rows carry their completion date, blocker-references-a-
+   real-task, no duplicates), appends the valid rows to the CSVs, and
+   writes every rejected row — including an unrecognised sheet or an
+   unreadable workbook — to `library/exceptions_report.csv` with a
+   category and detail. Nothing is silently dropped, and the whole batch
+   commits atomically: a failure partway through leaves every CSV, the
+   exceptions report, and the inbox exactly as they were, so a retry
+   starts clean instead of double-counting or wrongly rejecting a
+   duplicate. A `.sync.lock` file in `library/data/` enforces a local
+   single-writer restriction for the duration of one `sync` call.
+   Processed workbooks are moved to `library/inbox/processed/` so a
+   re-run can't double-apply them.
 5. `refresh` — builds `library/dashboards/master-dashboard.xlsx` (all
    3 teams) and one distributed copy per team
    (`team-aurora-dashboard.xlsx`, etc.), all computed from the same five
-   CSVs. Each has: a KPI table (done vs planned, done %, overdue,
+   CSVs. It refuses to run — rather than silently producing a
+   zero-activity dashboard — if a required CSV is missing or fails the
+   same schema validation `sync` uses (see "KPI definitions" below). Each
+   dashboard has: a KPI table (done vs planned, done %, overdue,
    open blockers, achievements this week), an Overdue Tasks sheet, an
    Open Blockers sheet (sorted by age), an Achievements This Week sheet,
-   and a native `openpyxl` line chart of tasks done per week.
+   and a native `openpyxl` line chart of tasks done per week. Every cell
+   is written as a literal value, including text that looks like a
+   formula (`=...`, `+...`) — source titles/descriptions are untrusted
+   input and are never allowed to become an executable cell.
 
 ## `library/` stands in for a SharePoint document library
 
@@ -60,19 +76,23 @@ other demos in this account.
 **An `.xlsx` with a working Power Query connection cannot be authored
 without Excel** — the connection is stored in a binary part
 (`DataMashup`) that only Excel itself writes when you build or refresh a
-query in its UI. No Python library, `openpyxl` included, can produce that
-part. Claiming a script-generated "connected" workbook would be false.
+query in its UI. This project does not ship, or test, any library capable
+of writing that part — `openpyxl`, the one used here, cannot. Claiming a
+script-generated "connected" workbook would be false for what's built
+here.
 
-So this repo ships the two things that are actually true and actually
-verified:
+So this repo ships one thing that's actually working and tested, and one
+that's exact but **unverified in Excel**:
 
 - **`powerquery/*.pq`** — the M query text for each of the five tables,
   parameterised by a `FolderPath` parameter, with exact paste-in
-  instructions in `powerquery/README.md`. You open Excel once, create the
-  parameter, paste in each query, and you have a live Power-Query-backed
-  workbook pointed at whatever folder you choose.
-- **The Python `refresh` command** — the actually-working path with no
-  Excel required, exercised by every test in this repo and by
+  instructions in `powerquery/README.md`. This text has not been pasted
+  into or run inside Excel in this environment (no copy of Excel exists
+  here to do that with) — it is **proposed and unverified**, not a
+  guaranteed working connection, until someone runs the paste-in steps
+  and confirms it.
+- **The Python `refresh` command** — the actually-working, actually-tested
+  path with no Excel required, exercised by every test in this repo and by
   `run_demo.sh`. It is what built the dashboards you'd find in
   `library/dashboards/` after running the demo.
 
@@ -128,7 +148,7 @@ export PYTHONPATH=src
 pytest tests -v
 ```
 
-31 tests: generator determinism and schema-shape checks; a **known-total
+47 tests: generator determinism and schema-shape checks; a **known-total
 reconciliation** suite (`test_dashboard_kpis.py`) that checks the
 generator's independently-tallied truth (`known_totals.json`) against both
 `kpis.compute_kpis`'s recomputation from the CSVs *and* the literal values
@@ -136,8 +156,15 @@ written into the built dashboard workbooks -- per team and overall; a
 failure test for every bad-input class `sync` rejects, plus an end-to-end
 test running `sync()` over a real filled-in workbook with one row from
 each class and checking every row is accounted for (accepted or rejected,
-never both, never silently dropped); and subprocess smoke tests of the
-full CLI pipeline.
+never both, never silently dropped); subprocess smoke tests of the
+full CLI pipeline; and `test_astra_probes.py` — an independent reviewer's
+(Astra) probes for source-validation and sync-integrity edge cases
+(reordered/duplicate/missing/extra headers, an unrecognised sheet, an
+unreadable workbook, infinite/non-integer numeric fields, a Done/Resolved
+row missing its completion date, a future-dated row, a formula-looking
+title, missing source CSVs, and an injected mid-batch write failure),
+each asserting the fixed behaviour rather than the bug it originally
+found.
 
 This reconciliation suite caught a real bug during development: the
 generator was originally bucketing "tasks done per week" by the week a
@@ -163,6 +190,20 @@ reconciliation check exists to catch.
 - **Weekly trend**: tasks done per week over the 8-week window, as a
   native `openpyxl` line chart (no image, no external charting library —
   it's a real Excel chart object you can click into and re-source).
+- **As-of snapshot policy (no time travel)**: a task or blocker whose
+  `created_date`/`raised_date` is after the dashboard's `--as-of` date is
+  excluded from that snapshot entirely — planned/done/overdue/open-blocker
+  totals, not just the weekly trend chart. Without this, a row dated in
+  the future relative to the snapshot could be counted into "current"
+  totals while its own trend bucket (correctly) showed nothing, which is
+  an inconsistent read of "as of" rather than a supported historical
+  reconstruction from mutable current status.
+- **Refresh reads a validated snapshot, not just whatever's on disk**:
+  `refresh` re-validates every row against the same schema `sync` uses
+  before computing anything, and refuses to run (raising
+  `SourceDataError`) if a required CSV is missing or any row fails —
+  never silently substituting a zero-activity dashboard for absent or
+  corrupt source data.
 
 KPI cells in the dashboard are **plain computed values**, not live Excel
 formulas — they're written by the Python `refresh` step reading the CSVs,
@@ -211,6 +252,17 @@ LICENSES.md             every open-source library used and its licence
   ever made.
 - 3 fictional teams / 4 members each / 8 weeks of history is the demo
   scale; nothing in the code hardcodes those numbers except the generator.
+- `sync`'s single-writer lock (`library/data/.sync.lock`) is a local file
+  that a hard-killed process (not an ordinary exception) can leave behind;
+  a stale lock has to be removed by hand before the next run. This is
+  the "local single-writer restriction" this demo relies on instead of
+  real concurrent-write handling — there is no SharePoint tenant here to
+  need that against.
+- `sync`'s batch commit makes each `sync()` call all-or-nothing (a failure
+  partway through leaves every file untouched), but it is not a durable
+  transaction log across a machine crash mid-`os.replace` — an
+  extraordinarily narrow window, not eliminated, only made as small as a
+  handful of fast local renames can make it.
 
 ## Target Upwork job types
 
@@ -219,5 +271,7 @@ KPI tracker"**, and **"Excel data validation / automation"** jobs.
 
 ## Role
 
-Automation engineer — designed and directed the build (AI-assisted
-coding). All data synthetic; no client work.
+Built with AI-assisted coding, including an independent AI review pass
+that found and required fixes for the source-validation and sync-integrity
+gaps described above (see `tests/test_astra_probes.py`). All data
+synthetic; no client work.

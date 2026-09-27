@@ -8,11 +8,17 @@ row is either accepted or it shows up in the exceptions report.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import date
 
 from .schema import TableSchema
 from .teams import TEAMS
+
+# Numeric fields that must be whole numbers, not just non-negative -- they
+# count tasks, so "1.5" or "inf" are both nonsensical even though the
+# generic non-negative-number check alone would accept them.
+INTEGER_NUMERIC_FIELDS = {"planned_tasks", "target_done"}
 
 
 @dataclass
@@ -124,14 +130,19 @@ def validate_rows(
                 )
                 continue
 
-        # 6. numeric fields must parse as non-negative numbers
+        # 6. numeric fields must parse as finite, non-negative numbers
+        # (explicitly rejects "inf"/"-inf"/"nan", which `float()` happily
+        # parses but which are meaningless as hours or task counts); the
+        # two task-count fields must additionally be whole numbers.
         numeric_fields = [f for f in ("hours_logged", "planned_tasks", "target_done") if f in table.columns]
         bad_numeric = None
         for f in numeric_fields:
             val = row.get(f)
             try:
                 num = float(val)
-                if num < 0 or num != num:  # NaN check
+                if not math.isfinite(num) or num < 0:
+                    raise ValueError
+                if f in INTEGER_NUMERIC_FIELDS and num != int(num):
                     raise ValueError
             except (TypeError, ValueError):
                 bad_numeric = (f, val)
@@ -139,7 +150,24 @@ def validate_rows(
         if bad_numeric:
             f, val = bad_numeric
             exceptions.append(
-                Exception_(table.name, source, i, "invalid_number", f"{f}={val!r} is not a non-negative number", raw)
+                Exception_(table.name, source, i, "invalid_number", f"{f}={val!r} is not a finite non-negative number"
+                            + (" (whole number required)" if f in INTEGER_NUMERIC_FIELDS else ""), raw)
+            )
+            continue
+
+        # 6b. status/date consistency: a status that implies completion
+        # must carry the date that completed it. Without this, a Done task
+        # or a Resolved blocker with no completion date silently passes,
+        # which is exactly the kind of state a "trustworthy dashboard"
+        # cannot allow (see docs/schema.md).
+        bad_consistency = None
+        if table.name == "tasks" and row.get("status") == "Done" and _is_blank(row.get("done_date")):
+            bad_consistency = "a Done task requires done_date"
+        elif table.name == "blockers" and row.get("status") == "Resolved" and _is_blank(row.get("resolved_date")):
+            bad_consistency = "a Resolved blocker requires resolved_date"
+        if bad_consistency:
+            exceptions.append(
+                Exception_(table.name, source, i, "inconsistent_status_date", bad_consistency, raw)
             )
             continue
 
