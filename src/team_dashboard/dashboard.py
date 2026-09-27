@@ -127,22 +127,31 @@ def _build_detail_sheets(wb: Workbook, teams: list[str], kpi_result: dict):
     _write_table(ws, 1, blocker_headers, blocker_rows)
 
 
-def _build_achievements_sheet(wb: Workbook, teams: list[str], data_dir: Path, as_of: date):
-    from . import csv_io, schema
+ACHIEVEMENT_DETAIL_HEADERS = ["achievement_id", "team", "member", "week_ending", "description"]
 
-    rows = csv_io.read_rows(data_dir / schema.ACHIEVEMENTS.filename, schema.ACHIEVEMENTS)
-    this_week = [r for r in rows if r["team"] in teams and r["week_ending"] == as_of.isoformat()]
+
+def _build_achievements_sheet(wb: Workbook, teams: list[str], kpi_result: dict):
+    # Fed from the same validated, as-of-pinned rows `compute_kpis` already
+    # tallied `achievements_this_week` from -- not a second, independent
+    # read of the mutable achievements.csv path -- and selected by column
+    # name rather than raw `dict.values()` order, so a source file whose
+    # header happens to be in a different (but still valid) column order
+    # can never land a value under the wrong header here.
+    this_week_rows = []
+    for t in teams:
+        this_week_rows.extend(kpi_result["teams"][t].achievements_this_week_rows)
+    rows = [[r[col] for col in ACHIEVEMENT_DETAIL_HEADERS] for r in this_week_rows]
     ws = wb.create_sheet("Achievements This Week")
-    _write_table(ws, 1, ["achievement_id", "team", "member", "week_ending", "description"], [list(r.values()) for r in this_week])
+    _write_table(ws, 1, ACHIEVEMENT_DETAIL_HEADERS, rows)
 
 
-def _build_workbook(teams: list[str], kpi_result: dict, data_dir: Path, as_of: date) -> Workbook:
+def _build_workbook(teams: list[str], kpi_result: dict, as_of: date) -> Workbook:
     wb = Workbook()
     ws = wb.active
     ws.title = "Overview"
     _build_overview(ws, teams, kpi_result, as_of)
     _build_detail_sheets(wb, teams, kpi_result)
-    _build_achievements_sheet(wb, teams, data_dir, as_of)
+    _build_achievements_sheet(wb, teams, kpi_result)
     return wb
 
 
@@ -159,12 +168,12 @@ def build_dashboards(data_dir: Path, out_dir: Path, as_of: date, teams: list[str
 
     out_dir.mkdir(parents=True, exist_ok=True)
     master_path = out_dir / "master-dashboard.xlsx"
-    master_wb = _build_workbook(team_names, kpi_result, data_dir, as_of)
+    master_wb = _build_workbook(team_names, kpi_result, as_of)
     master_wb.save(master_path)
 
     team_paths = {}
     for team in team_names:
-        team_wb = _build_workbook([team], kpi_result, data_dir, as_of)
+        team_wb = _build_workbook([team], kpi_result, as_of)
         path = out_dir / f"team-{_slug(team)}-dashboard.xlsx"
         team_wb.save(path)
         team_paths[team] = path

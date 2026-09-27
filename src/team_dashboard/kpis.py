@@ -64,6 +64,7 @@ class TeamKPIs:
     open_blockers_by_owner: dict[str, int] = field(default_factory=dict)
     open_blockers: list[dict] = field(default_factory=list)
     achievements_this_week: int = 0
+    achievements_this_week_rows: list[dict] = field(default_factory=list)
     weekly_done_trend: dict[str, int] = field(default_factory=dict)
 
 
@@ -97,25 +98,41 @@ def compute_kpis(data_dir: Path, as_of: date, num_weeks: int = 8, teams: list[st
         tk = result[team]
         planned_date = _parse_date(row["planned_date"])
         status = row["status"]
+        done_date = _parse_date(row["done_date"]) if row.get("done_date") else None
+        # A task's current `status` is mutable and describes *today*, not
+        # necessarily the as-of snapshot date -- but its `done_date`, once
+        # set, is an immutable fact about when it actually finished. A
+        # `status=Done` row whose own `done_date` is still after `as_of`
+        # had not finished yet as of this snapshot, so it must not count as
+        # done for it (that would be counting a future event into a past
+        # snapshot); this uses the row's own recorded date, not a claimed
+        # reconstruction of what its status "must have been" back then.
+        effective_done = status == "Done" and done_date is not None and done_date <= as_of
         tk.planned_total += 1
-        if status == "Done":
+        if effective_done:
             tk.done_total += 1
-            if row.get("done_date"):
-                dd = _parse_date(row["done_date"])
-                for start, end in windows:
-                    if start <= dd <= end:
-                        tk.weekly_done_trend[end.isoformat()] += 1
-                        break
-        if status != "Done" and planned_date < as_of:
+            for start, end in windows:
+                if start <= done_date <= end:
+                    tk.weekly_done_trend[end.isoformat()] += 1
+                    break
+        elif planned_date < as_of:
             tk.overdue_total += 1
             tk.overdue_tasks.append(row)
 
     for row in blockers:
         team = row["team"]
-        if team not in result or row["status"] != "Open":
+        if team not in result:
             continue
         if _parse_date(row["raised_date"]) > as_of:
             continue  # not raised yet as of this snapshot -- see as-of policy above
+        resolved_date = _parse_date(row["resolved_date"]) if row.get("resolved_date") else None
+        # Same immutable-date-over-mutable-status principle as tasks above:
+        # a `status=Resolved` blocker whose own `resolved_date` is still
+        # after `as_of` had not been resolved yet as of this snapshot, so
+        # it must still count as open for it.
+        effective_open = row["status"] == "Open" or (resolved_date is not None and resolved_date > as_of)
+        if not effective_open:
+            continue
         tk = result[team]
         tk.open_blockers_total += 1
         tk.open_blockers_by_owner[row["owner"]] = tk.open_blockers_by_owner.get(row["owner"], 0) + 1
@@ -128,6 +145,7 @@ def compute_kpis(data_dir: Path, as_of: date, num_weeks: int = 8, teams: list[st
             continue
         if row["week_ending"] == as_of.isoformat():
             result[team].achievements_this_week += 1
+            result[team].achievements_this_week_rows.append(row)
 
     overall = TeamKPIs()
     overall.weekly_done_trend = {w.isoformat(): 0 for w in week_endings}
@@ -139,6 +157,7 @@ def compute_kpis(data_dir: Path, as_of: date, num_weeks: int = 8, teams: list[st
         overall.open_blockers_total += tk.open_blockers_total
         overall.open_blockers.extend(tk.open_blockers)
         overall.achievements_this_week += tk.achievements_this_week
+        overall.achievements_this_week_rows.extend(tk.achievements_this_week_rows)
         for owner, n in tk.open_blockers_by_owner.items():
             overall.open_blockers_by_owner[owner] = overall.open_blockers_by_owner.get(owner, 0) + n
         for wk, n in tk.weekly_done_trend.items():

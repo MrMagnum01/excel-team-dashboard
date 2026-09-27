@@ -10,6 +10,11 @@ fixtures), the assertions themselves encode the review's required
 outcome, not the pre-fix one.
 
 Kept in this order to match the review's findings list.
+
+The re-review's follow-up probes (2026-09-27, commit 10d2fdb held) are
+wired in at the end of this file, in the same style: source
+`~/vault/40-sessions/2026-09-27-astra-excel-team-dashboard-rereview-probes.py`
+and `-rereview.md`/`-rereview-probes.json`.
 """
 
 from __future__ import annotations
@@ -298,3 +303,159 @@ def test_concurrent_sync_is_refused_by_the_local_lock(tmp_path):
         sync(tmp_path / "inbox", data, tmp_path / "exceptions.csv")
     # A refused run must not remove a lock file it didn't create itself.
     assert (data / ".sync.lock").exists()
+
+
+# ============================================================================
+# Re-review probes (2026-09-27, held commit 10d2fdb) -- each reproduces one
+# remaining finding from the re-review and asserts the behaviour the fix in
+# this commit now guarantees.
+# ============================================================================
+
+
+def _init_empty_tables(data_dir):
+    for tbl in schema.ALL_TABLES:
+        csv_io.write_rows(data_dir / tbl.filename, tbl, [])
+
+
+# --- Re-review finding 1 (High): commit-phase failure was not all-or-nothing
+
+
+def test_commit_phase_failure_leaves_every_table_untouched(tmp_path, monkeypatch):
+    """The original probe injected a failure into the *second* `os.replace`
+    call of a real `sync()` run (not a mocked staging write): the first
+    table's rename had already committed by the time the second one raised.
+    Before this commit that left `tasks.csv` updated and `weekly_updates.csv`
+    not, with the source workbook still pending -- so a retry re-submitted
+    the already-committed task and it came back as a spurious `duplicate_key`.
+    The commit phase must now back out its own already-applied renames on
+    failure, exactly like the staging phase already did.
+    """
+    import team_dashboard.sync as sync_module
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    data = tmp_path / "data"
+    _init_empty_tables(data)
+
+    w = Workbook()
+    w.remove(w.active)
+    rows = [
+        (schema.TASKS, _task()),
+        (schema.WEEKLY_UPDATES, dict(update_id="U1", team=TEAM, member=OWNER, week_ending=AS_OF.isoformat(), summary="Synthetic", hours_logged="1")),
+    ]
+    for tbl, row in rows:
+        s = w.create_sheet(SHEET_TITLES[tbl.name])
+        s.append(tbl.columns)
+        s.append([row.get(c, "") for c in tbl.columns])
+    w.save(inbox / "both.xlsx")
+
+    real_replace = sync_module.os.replace
+    calls = 0
+
+    def fail_second(a, b):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second commit-phase rename failure")
+        return real_replace(a, b)
+
+    monkeypatch.setattr(sync_module.os, "replace", fail_second)
+    with pytest.raises(OSError):
+        sync(inbox, data, tmp_path / "exceptions.csv")
+    monkeypatch.undo()
+
+    assert csv_io.read_rows(data / schema.TASKS.filename, schema.TASKS) == []
+    assert csv_io.read_rows(data / schema.WEEKLY_UPDATES.filename, schema.WEEKLY_UPDATES) == []
+    assert (inbox / "both.xlsx").exists()  # never archived -- nothing committed
+    assert not (data / ".sync.lock").exists()  # lock released even on failure
+    assert not list(data.glob("*.backup-*"))  # rollback cleaned up its own backups
+    assert not list(data.glob("*.stage-*"))
+
+    # A clean retry must accept both rows fresh, with no false duplicate --
+    # nothing from the failed attempt was ever actually committed.
+    retry = sync(inbox, data, tmp_path / "exceptions.csv")
+    assert retry["accepted"]["tasks"] == 1
+    assert retry["accepted"]["weekly_updates"] == 1
+    assert retry["exceptions"] == 0
+    assert retry["workbooks_processed"] == 1
+
+
+# --- Re-review finding 2 (Medium): malformed CSV header read as zero activity
+
+
+def test_malformed_csv_header_refuses_instead_of_reading_zero_rows(tmp_path):
+    """A `tasks.csv` whose header is `not_a_task_header` (not the schema's
+    columns) used to parse as a legitimate, merely-empty table --
+    `compute_kpis` returned `planned_total=0` instead of refusing. A
+    correct header-only (zero data rows) table must still be accepted."""
+    data = tmp_path / "bad-header"
+    _init_empty_tables(data)
+    (data / "tasks.csv").write_text("not_a_task_header\n")
+    with pytest.raises(SourceDataError):
+        compute_kpis(data, AS_OF)
+
+
+def test_correct_header_only_table_is_still_legitimately_empty(tmp_path):
+    data = tmp_path / "empty-but-correct"
+    _init_empty_tables(data)  # every table gets its real header, zero rows
+    result = compute_kpis(data, AS_OF)
+    assert result["overall"].planned_total == 0
+
+
+# --- Re-review finding 3 (Medium): reordered achievements.csv columns
+# corrupted the detail sheet
+
+
+def test_reordered_achievement_csv_columns_map_by_name_in_detail_sheet(tmp_path):
+    data = tmp_path / "reordered"
+    _init_empty_tables(data)
+    cols = list(reversed(schema.ACHIEVEMENTS.columns))
+    row = dict(achievement_id="A1", team=TEAM, member=OWNER, week_ending=AS_OF.isoformat(), description="Synthetic achievement")
+    import csv as csv_module
+
+    with (data / "achievements.csv").open("w", newline="") as f:
+        writer = csv_module.DictWriter(f, fieldnames=cols)
+        writer.writeheader()
+        writer.writerow(row)
+
+    result = build_dashboards(data, tmp_path / "dash", AS_OF)
+    ws = load_workbook(result["master"])["Achievements This Week"]
+    headers = [c.value for c in ws[1]]
+    values = [c.value for c in ws[2]]
+    assert headers == ["achievement_id", "team", "member", "week_ending", "description"]
+    assert dict(zip(headers, values)) == row
+
+
+# --- Re-review finding 4 (Medium): future completion/resolution still
+# counted as already done/resolved as of a snapshot before it happened
+
+
+def test_future_done_date_not_counted_done_but_task_is_overdue(tmp_path):
+    """A task created 2026-09-01, planned 2026-09-20, marked `Done` with
+    `done_date=2026-10-01` must not count as done as of 2026-09-21 -- its
+    own completion date says it hadn't finished yet by then. Since its
+    planned date has already passed and it wasn't done yet, it is overdue
+    as of this snapshot instead."""
+    data = tmp_path / "future-done"
+    _init_empty_tables(data)
+    csv_io.write_rows(data / "tasks.csv", schema.TASKS, [_task(status="Done", done_date="2026-10-01")])
+    k = compute_kpis(data, AS_OF)
+    assert k["overall"].done_total == 0
+    assert sum(k["overall"].weekly_done_trend.values()) == 0
+    assert k["overall"].overdue_total == 1
+
+
+def test_future_resolved_date_blocker_still_counts_as_open(tmp_path):
+    """Same principle on the blockers side: a blocker raised 2026-09-10,
+    marked `Resolved` with `resolved_date` after the as-of date, was not
+    actually resolved yet as of that snapshot."""
+    data = tmp_path / "future-resolved"
+    _init_empty_tables(data)
+    csv_io.write_rows(data / "tasks.csv", schema.TASKS, [_task()])
+    blocker = dict(
+        blocker_id="B1", team=TEAM, task_id="T1", owner=OWNER, description="x",
+        raised_date="2026-09-10", status="Resolved", resolved_date="2026-10-01",
+    )
+    csv_io.write_rows(data / "blockers.csv", schema.BLOCKERS, [blocker])
+    k = compute_kpis(data, AS_OF)
+    assert k["overall"].open_blockers_total == 1

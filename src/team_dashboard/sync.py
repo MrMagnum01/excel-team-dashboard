@@ -11,18 +11,31 @@ Two properties this module is written to hold, beyond per-row validation:
 
 - **Header-driven, not position-driven.** Every sheet's columns are
   resolved by matching its header row against the schema, not by column
-  position -- a reordered, duplicated, missing, or extra header is
-  rejected as an exception rather than silently misreading values into
+  position -- a reordered-but-complete header still reads correctly,
+  while a duplicated, missing, or extra header is rejected as one
+  exception for the sheet rather than silently misreading values into
   the wrong field.
-- **Batch commit, not a stream of appends.** All accepted rows for this
-  run are staged into temporary files next to their real CSVs; the real
-  files are only touched by a fast run of atomic renames after every
-  staged write has already succeeded. A failure anywhere during staging
-  (a bad row, an injected fault, a full disk) leaves every canonical CSV,
-  the exceptions report, and the inbox exactly as they were before this
-  call -- there is no partially-applied batch to reconcile, and a retry
-  starts clean. A `.sync.lock` file in `data_dir` enforces the local
-  single-writer restriction this implies (see the README).
+- **Batch commit, not a stream of appends -- staging and commit both.**
+  All accepted rows for this run are staged into temporary files next to
+  their real CSVs; nothing real is touched until every staged write has
+  already succeeded (a bad row, an injected fault, a full disk during
+  staging leaves every real file untouched, no cleanup needed). The
+  commit phase that follows is not one atomic filesystem operation --
+  a single rename() can't span several independent files -- so it is
+  built as backup-then-swap-then-cleanup instead: every real file this
+  batch changes is first moved aside with its own atomic rename, then
+  the staged replacement is swapped into its place; if any step raises,
+  every already-swapped file in this batch is put back from its backup
+  before the error propagates. A fault anywhere during commit, not only
+  during staging, therefore still leaves every canonical CSV, the
+  exceptions report, and the inbox exactly as they were before this
+  call, and a retry starts clean rather than replaying a partially
+  committed batch as a false duplicate. The one case this doesn't cover
+  is a hard-killed process (not an ordinary exception) between two of
+  those renames -- see the README's "Limits" section for that residual,
+  by-hand-recoverable window, the same class of caveat as the stale
+  `.sync.lock` file below. A `.sync.lock` file in `data_dir` enforces the
+  local single-writer restriction this implies (see the README).
 """
 
 from __future__ import annotations
@@ -253,13 +266,45 @@ def sync(inbox_dir: Path, data_dir: Path, exceptions_path: Path) -> dict:
             raise
 
         # --- commit phase --------------------------------------------------
-        # `os.replace` is atomic on a POSIX filesystem; running every
-        # replace back-to-back with no other I/O between them is what
-        # "commit" means for a set of plain files with no shared
-        # transaction log. This is the local-single-writer-lock-protected
-        # window this module's docstring refers to.
-        for real_path, tmp_path in staged.items():
-            os.replace(tmp_path, real_path)
+        # `os.replace` is atomic on a POSIX filesystem for a *single* file,
+        # but this batch touches several independent files with no shared
+        # transaction log, so "all of them or none" has to be built rather
+        # than assumed. Backup-then-swap-then-cleanup: every real file is
+        # first moved aside (an atomic rename that either fully succeeds or
+        # changes nothing), then the staged replacement is swapped into its
+        # place. If any step in this loop raises, every already-swapped
+        # file in this batch is restored from its backup (or removed, if it
+        # had no prior version) before the failure propagates -- so a fault
+        # partway through commit, not only during staging, still leaves
+        # every canonical CSV and the exceptions report exactly as they
+        # were before this call. This is the local-single-writer-lock-
+        # protected window this module's docstring refers to.
+        renamed_away: dict[Path, Path] = {}  # real_path -> backup of its pre-batch content
+        swapped_in: set[Path] = set()  # real_path -> this batch's staged content now in place
+        try:
+            for real_path, tmp_path in staged.items():
+                if real_path.exists():
+                    backup_path = real_path.with_name(real_path.name + f".backup-{batch_id}")
+                    os.replace(real_path, backup_path)
+                    renamed_away[real_path] = backup_path
+                os.replace(tmp_path, real_path)
+                swapped_in.add(real_path)
+        except Exception:
+            for real_path in reversed(list(staged.keys())):
+                if real_path in renamed_away:
+                    os.replace(renamed_away[real_path], real_path)
+                elif real_path in swapped_in:
+                    real_path.unlink(missing_ok=True)
+            # Any staged tmp file not yet consumed by its own os.replace
+            # above (the one that failed, and every one after it in
+            # iteration order that was never reached) is leftover staging
+            # residue, same as a staging-phase failure already cleans up.
+            for tmp_path in staged.values():
+                tmp_path.unlink(missing_ok=True)
+            raise
+        finally:
+            for backup_path in renamed_away.values():
+                backup_path.unlink(missing_ok=True)
 
         # --- archive phase ---------------------------------------------
         # Only workbooks that were actually read (not ones that failed to

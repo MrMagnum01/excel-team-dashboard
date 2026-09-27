@@ -29,22 +29,28 @@ employer project.
    demo: a mix of valid rows and one row from every bad-input class `sync`
    checks for, so the demo run actually shows rejections happening.
 4. `sync` — reads every `.xlsx` dropped into `library/inbox/`, resolves
-   each sheet's columns by its header row (not by position — a
-   reordered, duplicated, missing, or extra header is rejected as an
-   exception rather than misread), validates every row (required fields,
-   dates, enums, team/member membership, finite non-negative numbers,
-   Done/Resolved rows carry their completion date, blocker-references-a-
-   real-task, no duplicates), appends the valid rows to the CSVs, and
-   writes every rejected row — including an unrecognised sheet or an
-   unreadable workbook — to `library/exceptions_report.csv` with a
-   category and detail. Nothing is silently dropped, and the whole batch
-   commits atomically: a failure partway through leaves every CSV, the
-   exceptions report, and the inbox exactly as they were, so a retry
-   starts clean instead of double-counting or wrongly rejecting a
-   duplicate. A `.sync.lock` file in `library/data/` enforces a local
-   single-writer restriction for the duration of one `sync` call.
-   Processed workbooks are moved to `library/inbox/processed/` so a
-   re-run can't double-apply them.
+   each sheet's columns by its header row, not by position — a
+   reordered-but-complete header still reads correctly, while a
+   duplicated, missing, or extra header is rejected as one exception for
+   the whole sheet rather than misread — validates every row (required
+   fields, dates, enums, team/member membership, finite non-negative
+   numbers, Done/Resolved rows carry their completion date,
+   blocker-references-a-real-task, no duplicates), appends the valid rows
+   to the CSVs, and writes every rejected row — including an
+   unrecognised sheet or an unreadable workbook — to
+   `library/exceptions_report.csv` with a category and detail. Nothing is
+   silently dropped, and the batch commits as an all-or-nothing unit
+   across both its staging and commit phases: every real file this batch
+   changes is backed up before its replacement is swapped in, and a
+   failure at any point restores every already-swapped file from its
+   backup before the error is raised — a failure partway through, staging
+   or commit, leaves every CSV, the exceptions report, and the inbox
+   exactly as they were, so a retry starts clean instead of
+   double-counting or wrongly rejecting a duplicate (see "Limits" for the
+   one residual case this doesn't cover). A `.sync.lock` file in
+   `library/data/` enforces a local single-writer restriction for the
+   duration of one `sync` call. Processed workbooks are moved to
+   `library/inbox/processed/` so a re-run can't double-apply them.
 5. `refresh` — builds `library/dashboards/master-dashboard.xlsx` (all
    3 teams) and one distributed copy per team
    (`team-aurora-dashboard.xlsx`, etc.), all computed from the same five
@@ -73,11 +79,10 @@ other demos in this account.
 
 ## Power Query: shipped as M code, not as a working connection
 
-**An `.xlsx` with a working Power Query connection cannot be authored
-without Excel** — the connection is stored in a binary part
-(`DataMashup`) that only Excel itself writes when you build or refresh a
-query in its UI. This project does not ship, or test, any library capable
-of writing that part — `openpyxl`, the one used here, cannot. Claiming a
+**This demo does not ship or test a connected Power Query workbook.** A
+live Power Query connection is stored in a binary part (`DataMashup`)
+that only Excel itself writes when you build or refresh a query in its
+UI; `openpyxl`, the library used here, cannot write that part. Claiming a
 script-generated "connected" workbook would be false for what's built
 here.
 
@@ -148,7 +153,7 @@ export PYTHONPATH=src
 pytest tests -v
 ```
 
-47 tests: generator determinism and schema-shape checks; a **known-total
+53 tests: generator determinism and schema-shape checks; a **known-total
 reconciliation** suite (`test_dashboard_kpis.py`) that checks the
 generator's independently-tallied truth (`known_totals.json`) against both
 `kpis.compute_kpis`'s recomputation from the CSVs *and* the literal values
@@ -158,13 +163,19 @@ test running `sync()` over a real filled-in workbook with one row from
 each class and checking every row is accounted for (accepted or rejected,
 never both, never silently dropped); subprocess smoke tests of the
 full CLI pipeline; and `test_astra_probes.py` — an independent reviewer's
-(Astra) probes for source-validation and sync-integrity edge cases
-(reordered/duplicate/missing/extra headers, an unrecognised sheet, an
-unreadable workbook, infinite/non-integer numeric fields, a Done/Resolved
-row missing its completion date, a future-dated row, a formula-looking
-title, missing source CSVs, and an injected mid-batch write failure),
-each asserting the fixed behaviour rather than the bug it originally
-found.
+(Astra) probes for source-validation and sync-integrity edge cases, in two
+rounds. First round (reordered/duplicate/missing/extra headers, an
+unrecognised sheet, an unreadable workbook, infinite/non-integer numeric
+fields, a Done/Resolved row missing its completion date, a future-created
+row, a formula-looking title, missing source CSVs, and an injected
+staging-phase write failure). Second round, from the re-review of the
+first round's fixes (an injected failure during the *commit* phase's own
+renames, not just staging; a malformed canonical-CSV header read as a
+plausible empty table instead of refused; reordered achievements.csv
+columns read by position instead of by name; a future `done_date`/
+`resolved_date` still counted as already done/resolved as of an earlier
+snapshot). Each asserts the fixed behaviour rather than the bug it
+originally found.
 
 This reconciliation suite caught a real bug during development: the
 generator was originally bucketing "tasks done per week" by the week a
@@ -177,16 +188,27 @@ reconciliation check exists to catch.
 
 ## KPI definitions
 
+`compute_kpis` reads three of the five tables — `tasks.csv`,
+`blockers.csv`, and `achievements.csv`. `weekly_updates.csv` and
+`kpi_targets.csv` are not consumed by any KPI figure or dashboard sheet;
+`sync` still validates and appends rows to both.
+
 - **Done vs planned**: `done_total` / `planned_total` per team, where
-  `planned_total` is every task recorded for that team and `done_total` is
-  the count with `status = Done`.
-- **Overdue**: tasks with `status != Done` and `planned_date` before the
-  as-of date.
-- **Open blockers by age and owner**: every `blockers.csv` row with
-  `status = Open`, with `age_days = as_of - raised_date`, listed per owner
-  and sorted oldest-first in the dashboard's Open Blockers sheet.
+  `planned_total` is every task recorded for that team (as of the
+  snapshot; see below) and `done_total` is the count that had actually
+  completed by the as-of date (see "effective status" below).
+- **Overdue**: tasks that had not completed by the as-of date and whose
+  `planned_date` is before it.
+- **Open blockers by age and owner**: every blocker still open as of the
+  as-of date (see "effective status" below), with
+  `age_days = as_of - raised_date`, listed per owner and sorted
+  oldest-first in the dashboard's Open Blockers sheet.
 - **Achievements this week**: `achievements.csv` rows whose `week_ending`
-  equals the as-of date.
+  equals the as-of date; the same validated rows feed both the KPI count
+  and the dashboard's Achievements This Week detail sheet (one read, not
+  two, so the sheet can't disagree with the count or misread a
+  reordered-but-valid header — see "Sheet-level checks" in
+  `docs/schema.md`).
 - **Weekly trend**: tasks done per week over the 8-week window, as a
   native `openpyxl` line chart (no image, no external charting library —
   it's a real Excel chart object you can click into and re-source).
@@ -198,12 +220,25 @@ reconciliation check exists to catch.
   totals while its own trend bucket (correctly) showed nothing, which is
   an inconsistent read of "as of" rather than a supported historical
   reconstruction from mutable current status.
+- **Effective status uses the row's own recorded date, not its current
+  (mutable) status label**: `status` describes the row *today*, but a
+  `done_date`/`resolved_date` is an immutable fact about when completion
+  actually happened. A `status = Done` task whose `done_date` is after
+  `as_of`, or a `status = Resolved` blocker whose `resolved_date` is after
+  `as_of`, had not completed yet as of that snapshot — it counts as still
+  open/not-done for that snapshot instead (and, for a task, as overdue if
+  its `planned_date` had also already passed). This reads the row's own
+  date field directly; it is not a claimed reconstruction of what the
+  row's status "must have been" at an earlier point in time from history
+  that isn't recorded anywhere.
 - **Refresh reads a validated snapshot, not just whatever's on disk**:
   `refresh` re-validates every row against the same schema `sync` uses
   before computing anything, and refuses to run (raising
-  `SourceDataError`) if a required CSV is missing or any row fails —
-  never silently substituting a zero-activity dashboard for absent or
-  corrupt source data.
+  `SourceDataError`) if a required CSV is missing, has the wrong header,
+  or any row fails — never silently substituting a zero-activity
+  dashboard for absent, mis-headed, or corrupt source data. A
+  header-only file with the correct columns is still a legitimate empty
+  table.
 
 KPI cells in the dashboard are **plain computed values**, not live Excel
 formulas — they're written by the Python `refresh` step reading the CSVs,
@@ -258,11 +293,16 @@ LICENSES.md             every open-source library used and its licence
   the "local single-writer restriction" this demo relies on instead of
   real concurrent-write handling — there is no SharePoint tenant here to
   need that against.
-- `sync`'s batch commit makes each `sync()` call all-or-nothing (a failure
-  partway through leaves every file untouched), but it is not a durable
-  transaction log across a machine crash mid-`os.replace` — an
-  extraordinarily narrow window, not eliminated, only made as small as a
-  handful of fast local renames can make it.
+- `sync`'s batch commit makes each `sync()` call all-or-nothing for any
+  ordinary exception during staging or commit (backup-then-swap-then-
+  cleanup rolls back every already-applied rename in the batch — see
+  `sync.py`'s module docstring), but it is not a durable transaction log
+  across a hard-killed process (not an ordinary exception) between two of
+  those renames: that can leave a stray `*.backup-<batch-id>` file next to
+  its real CSV, which must be restored over it by hand before the next
+  `sync` run — the same class of by-hand-recoverable caveat as the stale
+  `.sync.lock` file above, and an equally narrow window (a handful of fast
+  local renames), not a claim that no window exists at all.
 
 ## Target Upwork job types
 

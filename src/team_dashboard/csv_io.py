@@ -32,10 +32,29 @@ def write_rows(path: Path, schema: TableSchema, rows: list[dict]) -> None:
 
 
 def read_rows(path: Path, schema: TableSchema) -> list[dict]:
+    """Read every data row of `path` as a dict keyed by `schema`'s columns.
+
+    A missing file is treated as legitimately empty (the caller decides
+    whether that's acceptable). A file that *exists* must have exactly
+    `schema`'s columns in its header row -- as a set, so a reordered-but-
+    complete header is fine, matching how `sync.py` reads workbook sheets
+    -- or every row is refused before any is read: a wrong, mistyped, or
+    truncated header (`not_a_task_header` instead of the schema's columns,
+    say) must not be read as a quietly-empty, schema-correct table just
+    because it happens to have zero data rows.
+    """
     if not path.exists():
         return []
     with path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        if sorted(fieldnames) != sorted(schema.columns):
+            raise SourceDataError(
+                f"{path} header {fieldnames} does not exactly match expected columns "
+                f"{schema.columns} (missing, extra, or duplicate column name) -- refusing to "
+                "read rows from a table whose schema doesn't match, rather than treating a "
+                "wrong header as zero real activity"
+            )
         return [dict(row) for row in reader]
 
 
